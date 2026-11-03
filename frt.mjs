@@ -376,7 +376,7 @@ function makeGit(installRes) {
 async function scan(opts, P, onProgress = () => {}) {
   const S = new Scan();
   const t0 = Date.now();
-  const total = 17 + (opts.offline ? 0 : 1) + opts.errors.length;
+  const total = 21 + (opts.offline ? 0 : 1) + opts.errors.length;
   let done = 0;
   const step = async (name, fn) => {
     onProgress({ step: name, done: done++, total });
@@ -400,6 +400,10 @@ async function scan(opts, P, onProgress = () => {}) {
   await step('folder approvals', () => checkGrants(ctx));
   await step('worktrees', () => checkWorktrees(ctx));
   await step('chats', () => checkThreads(ctx));
+  await step('chat folders', () => checkThreadDirs(ctx));
+  await step('local vs cloud', () => checkCloudRouting(ctx));
+  await step('skills', () => checkSkills(ctx));
+  await step('credits', () => checkRefunds(ctx));
   await step('git repositories', () => checkGit(ctx));
   await step('pending transfers', () => checkJournals(ctx));
   await step('disk and filesystems', () => checkDisks(ctx));
@@ -757,7 +761,7 @@ function checkDatabases({ P, S, opts }) {
       entry.journalMode = db.query('PRAGMA journal_mode').get()?.journal_mode;
       if (objects.has('threads')) {
         const cols = tableColumns(db, 'threads');
-        const want = ['id', 'project_id', 'project_path', 'title', 'status', 'execution_mode', 'execution_target', 'worktree_path', 'branch', 'source_branch', 'turn_state', 'cloud_account_id', 'cloud_api_host', 'cloud_handoff_pending', 'local_handoff_pending', 'local_history_only', 'sidebar_archived_at', 'created_at', 'updated_at', 'last_prompt_at', 'workspace_epoch'];
+        const want = ['id', 'project_id', 'project_path', 'title', 'status', 'execution_mode', 'execution_target', 'worktree_path', 'branch', 'source_branch', 'turn_state', 'cloud_account_id', 'cloud_api_host', 'cloud_handoff_pending', 'local_handoff_pending', 'local_history_only', 'next_execution_target', 'sidebar_archived_at', 'created_at', 'updated_at', 'last_prompt_at', 'workspace_epoch'];
         const sel = want.filter((c) => cols.has(c));
         entry.threads = db.query(`SELECT ${sel.join(', ')} FROM threads`).all();
         entry.messageCounts = Object.fromEntries(objects.has('messages') ? db.query('SELECT thread_id, count(*) AS n, max(ts) AS last FROM messages GROUP BY thread_id').all().map((r) => [r.thread_id, { n: r.n, last: r.last }]) : []);
@@ -973,6 +977,124 @@ function checkThreads({ P, S, opts }) {
   if (orphans.length) S.add({ severity: 'info', area: 'Worktrees', title: `${orphans.length} worktree(s) belong to chats that no longer exist`, detail: 'Freebuff cleans these up over time. They only use disk space; uncommitted work in them is still on disk.', evidence: orphans.map((w) => `${w.path}${w.size ? ` (${fmtBytes(w.size.bytes)})` : ''}`) });
   S.inventory.threads = threads.map((t) => ({ id: t.id, title: opts.hideTitles ? undefined : truncate(t.title, 60), project: basename(t.db.projectPath ?? t.project_path ?? '?'), where: t.execution_target ?? 'local', mode: t.execution_mode, worktree: t.worktree_path ?? null, branch: t.branch ?? null, messages: t.messages, state: t.turn_state, updated: t.updated_at }));
   if (checked && !S.findings.some((f) => f.area === area && (f.severity === 'error' || f.severity === 'warn'))) S.ok(area, `${checked} chat(s) checked: worktrees, links and transfers look consistent`);
+}
+
+function editState(fx, P, mutate) {
+  fx.backupFile(P.statePath);
+  const cur = JSON.parse(readFileSync(P.statePath, 'utf8'));
+  mutate(cur);
+  const tmp = `${P.statePath}.frt-tmp`;
+  writeFileSync(tmp, JSON.stringify(cur, null, 2));
+  renameRetry(tmp, P.statePath);
+}
+
+function checkCloudRouting({ P, S }) {
+  const area = 'Local vs Cloud';
+  const st = S.state ?? {};
+  const prefs = st.uiPrefs ?? {};
+  const grants = Array.isArray(st.deviceReconnectGrants) ? st.deviceReconnectGrants : [];
+  const registered = [];
+  for (const p of S.projectsList ?? []) {
+    const saved = st.projects?.[p.path] ?? {};
+    if (p.location !== 'local') continue;
+    const db = (S.dbs ?? []).find((d) => d.projectPath && samePath(d.projectPath, p.path));
+    const threads = db?.threads ?? [];
+    const cloudRuns = threads.filter((t) => t.execution_target === 'cloud' || t.next_execution_target === 'cloud');
+    if (saved.deviceCloud || saved.cloudProjectId) registered.push(`${p.name}${saved.deviceCloud ? ' (enabled for Cloud/web chats)' : ''}`);
+    const noFolderProject = saved.noFolder === true || within(p.path, join(P.profileDir, 'local-projects'));
+    if (saved.defaultLocation === 'cloud' && saved.cloudPolicy !== 'never' && !noFolderProject) {
+      S.add({ severity: 'error', area, key: `cloud-default:${p.path}`, title: `New chats in "${p.name}" start in Cloud, not on this computer`, detail: `This project's default run location is Cloud. Chats then run on Freebuff's servers and use Cloud credits; they can only see your files while Freebuff Desktop keeps the folder connected ("Your folder isn't connected to Freebuff yet. Keep Freebuff Desktop open and try again in a moment."), and they show up on the web app.${cloudRuns.length ? ` ${cloudRuns.length} chat(s) in this project are set to run in Cloud.` : ''}`,
+        evidence: [`state.json projects[${p.path}].defaultLocation = "cloud"`, ...cloudRuns.slice(0, 8).map((t) => `chat ${short(t.id)} "${truncate(t.title, 40)}": runs in ${t.execution_target}, next run in ${t.next_execution_target ?? t.execution_target}`)],
+        steps: ['Run the repair to make new chats start on this computer (Local) again.', 'For existing chats: open the chat and pick "Local" in the location picker beside the model.'],
+        fix: { id: `cloud-default:${p.path}`, title: `Make new chats in "${p.name}" start on this computer`, risk: 'low — changes one project setting in state.json (backed up)', apply: (fx) => { editState(fx, P, (s) => { s.projects[p.path].defaultLocation = 'local'; }); fx.log(`projects[${p.path}].defaultLocation = "local"`); } } });
+    } else if (cloudRuns.length) {
+      S.add({ severity: 'info', area, key: `cloud-chats:${p.path}`, title: `${cloudRuns.length} chat(s) in "${p.name}" run in Cloud`, detail: 'These chats run on Freebuff\'s servers and use Cloud credits. They reach your local files only through a live folder connection from Freebuff Desktop.', evidence: cloudRuns.slice(0, 8).map((t) => `chat ${short(t.id)} "${truncate(t.title, 40)}"`), steps: ['To run one on this computer instead: open it and choose "Local" in the location picker beside the model.'] });
+    }
+    if (cloudRuns.length && p.exists) {
+      const ok = grants.some((g) => g.accountId === S.accountId && g.installId === st.installId && samePath(g.path, p.path));
+      if (!ok) S.add({ severity: 'error', area, key: `no-connection:${p.path}`, title: `Cloud chats in "${p.name}" cannot reach your files`, detail: 'There is no valid folder approval for this project on this computer, so chats running in Cloud get "Your folder isn\'t connected to Freebuff yet. Keep Freebuff Desktop open and try again in a moment." and cannot read files or use your local skills.', evidence: [p.path], steps: ['In Freebuff Desktop choose "Open local folder" and select this project folder, and keep Desktop running while the chat works.', 'Or switch the chat to "Local" so it runs on this computer.'] });
+    }
+  }
+  if (prefs.cloudPresync === true) S.add({ severity: 'warn', area, key: 'cloud-presync', title: 'Background upload of your Git projects to Cloud is ON', detail: 'Freebuff uploads a snapshot of every local Git project (latest commit) to Cloud so Cloud chats can start faster. Projects set to "never use Cloud" are skipped.', evidence: ['state.json uiPrefs.cloudPresync = true'], steps: ['Turn it off in Freebuff settings, or run the repair.'],
+    fix: { id: 'cloud-presync', title: 'Turn off background upload of projects to Cloud', risk: 'low — one setting in state.json (backed up)', apply: (fx) => { editState(fx, P, (s) => { s.uiPrefs = { ...(s.uiPrefs ?? {}), cloudPresync: false }; }); fx.log('uiPrefs.cloudPresync = false'); } } });
+  if (prefs.mobileMirror === true) S.add({ severity: 'info', area, title: 'Mobile mirror is on', detail: 'Chats are mirrored so they can be followed from the web/phone.' });
+  const uploads = join(P.profileDir, 'cloud-source-uploads');
+  if (isDir(uploads)) { const s = dirStats(uploads, 20000); if (s.files) S.add({ severity: 'info', area, title: `Freebuff has uploaded project files to Cloud (${s.files} upload record(s), ${fmtBytes(s.bytes)})`, detail: 'These records are written when a project or chat is sent to Cloud (moving a chat to Cloud, background upload, or starting a Cloud chat).', evidence: [uploads] }); }
+  if (registered.length) S.add({ severity: 'info', area, title: `${registered.length} local project(s) are registered with Freebuff Cloud`, detail: 'This is why they appear on the web app. Registering sends the project\'s name and ID; files are only uploaded when a chat runs in Cloud or background upload is on.', evidence: registered });
+}
+
+function parseSkill(file) {
+  const text = readText(file);
+  if (text === null) return { error: 'SKILL.md is missing' };
+  const fm = text.replace(/^﻿/, '').match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!fm) return { error: 'SKILL.md has no front matter (--- name / description --- block at the top)' };
+  const field = (k) => { const m = fm[1].match(new RegExp(`^${k}:\\s*(.*)$`, 'm')); if (!m) return null; let v = m[1].trim(); if (/^[>|][-+]?$/.test(v)) { const rest = fm[1].slice(fm[1].indexOf(m[0]) + m[0].length).split(/\r?\n/).slice(1); v = rest.filter((l) => /^\s+\S/.test(l)).map((l) => l.trim()).join(' '); } return v.replace(/^["']|["']$/g, ''); };
+  const name = field('name'), description = field('description');
+  if (!name) return { error: 'front matter has no "name:"' };
+  if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(name) || name.length > 64) return { name, error: `name "${truncate(name, 40)}" is invalid (use lowercase letters, digits and single hyphens, max 64 characters)` };
+  if (!description) return { name, error: 'front matter has no "description:"' };
+  return { name, description };
+}
+function checkSkills({ P, S }) {
+  const area = 'Skills';
+  const roots = (S.projectsList ?? []).filter((p) => p.exists).map((p) => ({ label: `project "${p.name}"`, dir: p.path }));
+  const places = [{ label: 'your home folder', dir: P.home }, ...roots];
+  const found = [], seen = new Set();
+  for (const { label, dir } of places) {
+    for (const base of ['.agents', '.claude', '.freebuff']) {
+      const right = join(dir, base, 'skills');
+      for (const wrong of ['skill', 'Skills', 'SKILLS', '_skills']) {
+        const w = join(dir, base, wrong);
+        if (!isDir(w) || (IS_WIN || IS_MAC) && wrong.toLowerCase() === 'skills') continue;
+        const kids = listDir(w).filter((e) => e.isDirectory()).map((e) => e.name);
+        if (!kids.length) continue;
+        const clash = kids.filter((k) => existsSync(join(right, k)));
+        S.add({ severity: 'error', area, key: `skill-dir:${w}`, title: `Skills folder in ${label} is named "${base}/${wrong}" — Freebuff only reads "${base}/skills"`, detail: `Freebuff loads skills from .agents/skills, .claude/skills and .freebuff/skills (in your home folder and in each project). The ${kids.length} skill(s) in "${wrong}" are invisible to it.`, evidence: [w, ...kids.slice(0, 10).map((k) => `  ${k}`)],
+          steps: [`Rename the folder "${wrong}" to "skills" (or run the repair).`],
+          fix: clash.length ? undefined : { id: `skill-dir:${w}`, title: `Rename ${base}/${wrong} to ${base}/skills in ${label}`, risk: 'low — moves the skill folders; nothing is deleted', apply: (fx) => { if (!isDir(right)) { renameRetry(w, right); fx.manifest.entries.push({ action: 'renamed', original: w, now: right }); fx.save(); } else { for (const k of kids) { renameRetry(join(w, k), join(right, k)); fx.manifest.entries.push({ action: 'renamed', original: join(w, k), now: join(right, k) }); fx.save(); } if (!listDir(w).length) { rmSync(w, { recursive: true, force: true }); fx.manifest.entries.push({ action: 'removed-empty-dir', original: w }); fx.save(); } } fx.log(`${w} → ${right}`); } } });
+      }
+      for (const e of listDir(right).filter((x) => x.isDirectory() || x.isSymbolicLink())) {
+        const skillDir = join(right, e.name);
+        if (seen.has(normPath(canonical(skillDir)))) continue; seen.add(normPath(canonical(skillDir)));
+        const r = parseSkill(join(skillDir, 'SKILL.md'));
+        found.push({ where: `${label}: ${base}/skills/${e.name}`, ...r });
+        if (r.error) S.add({ severity: 'warn', area, title: `Skill "${e.name}" in ${label} is not loaded`, detail: `Freebuff skips it: ${r.error}.`, evidence: [join(skillDir, 'SKILL.md')], steps: ['Fix the SKILL.md front matter, for example:\n---\nname: my-skill\ndescription: What it does and when to use it.\n---'] });
+      }
+    }
+  }
+  S.inventory.skills = found.map((f) => `${f.where} — ${f.error ? `NOT LOADED: ${f.error}` : f.name}`);
+  const names = found.filter((f) => f.name && !f.error).map((f) => f.name);
+  const dups = [...new Set(names.filter((n, i) => names.indexOf(n) !== i))];
+  if (dups.length) S.add({ severity: 'info', area, title: `${dups.length} skill name(s) exist in more than one folder`, detail: 'Only one copy of each name is used; edits to the other copy have no effect.', evidence: dups });
+  if (found.length && !found.some((f) => f.error)) S.ok(area, `${found.length} skill(s) found and valid`);
+  if (!found.length) S.add({ severity: 'info', area, title: 'No skills found in this computer\'s skill folders', detail: 'Looked in .agents/skills, .claude/skills and .freebuff/skills in your home folder and every project.' });
+}
+
+function checkThreadDirs({ P, S }) {
+  const area = 'Chats';
+  for (const p of S.projectsList ?? []) {
+    const saved = S.state?.projects?.[p.path] ?? {};
+    const noFolder = saved.noFolder === true || (saved.location === 'cloud' && saved.cloudProjectId === null) || within(p.path, join(P.profileDir, 'local-projects'));
+    if (!noFolder || !p.exists) continue;
+    const db = (S.dbs ?? []).find((d) => d.projectPath && samePath(d.projectPath, p.path));
+    const missing = (db?.threads ?? []).filter((t) => !t.sidebar_archived_at).map((t) => ({ t, dir: join(p.path, 'threads', sha(t.id)) })).filter((x) => !isDir(x.dir));
+    if (!missing.length) continue;
+    S.add({ severity: 'error', area, key: `thread-dirs:${p.path}`, title: `${missing.length} chat folder(s) missing in "${p.name}"`, detail: `Chats in a project without its own folder each get a private folder. These were deleted (by a cleanup tool, antivirus, a sync tool or manually), so opening the chat fails with "ENOENT: no such file or directory, lstat '…\\threads\\<id>'". Files the chat created there are gone; the conversation itself is intact.`,
+      evidence: missing.slice(0, 10).map((x) => `"${truncate(x.t.title, 40)}" → ${x.dir}`), steps: ['Run the repair: it recreates the empty folders so the chats open again.'],
+      fix: { id: `thread-dirs:${p.path}`, title: `Recreate ${missing.length} missing chat folder(s) in "${p.name}"`, risk: 'none — creates empty folders', apply: (fx) => { for (const x of missing) { mkdirSync(x.dir, { recursive: true }); fx.recordCreated(x.dir); fx.log(`created ${x.dir}`); } } } });
+  }
+}
+
+function checkRefunds({ P, S }) {
+  const area = 'Credits';
+  const j = readJson(`${P.statePath}.session-refunds.json`);
+  if (j.status !== 'ok' || !Array.isArray(j.value)) return;
+  const by = (s) => j.value.filter((e) => e?.status === s);
+  const open = [...by('pending'), ...by('retrying'), ...by('unreported')];
+  const refunded = by('settled').filter((e) => (e.freebucks ?? 0) > 0);
+  S.inventory.refunds = { entries: j.value.length, open: open.length, refunded: refunded.length, refundedFreebucks: refunded.reduce((s, e) => s + (e.freebucks ?? 0), 0) };
+  if (open.length) S.add({ severity: 'warn', area, title: `${open.length} unused-session refund(s) have not been confirmed yet`, detail: 'Freebuff refunds sessions that ended without being used. These claims are waiting to be confirmed by the server; Freebuff retries them while it runs and is signed in.', evidence: open.slice(0, 8).map((e) => `chat ${short(e.admission?.threadId)}: ${e.status}, ${iso(e.updatedAt)}`), steps: ['Keep Freebuff open and signed in with internet access for a few minutes so it can retry.', 'If they stay unconfirmed, send this report to support — it lists the affected sessions.'] });
+  else if (j.value.length) S.ok(area, `${j.value.length} session refund record(s), all settled${refunded.length ? ` (${refunded.length} refunded)` : ''}`);
 }
 
 function checkGit({ S, P }) {
@@ -1204,6 +1326,12 @@ async function checkNetwork({ S }) {
 }
 
 const KNOWN_ERRORS = [
+  { re: /isn.t connected to Freebuff yet|Keep Freebuff Desktop open and try again/i, title: 'Your folder isn\'t connected to Freebuff yet', meaning: 'The chat is running in Freebuff Cloud, not on this computer. Cloud chats can only read your files and local skills through a live connection from Freebuff Desktop to the project folder, and that connection is missing.',
+    causes: ['The project is set to start new chats in Cloud (the repair tool can switch it back to Local).', 'The folder was never approved on this computer ("Open local folder"), or the approval no longer matches the folder.', 'Freebuff Desktop was closed, asleep or offline while the Cloud chat ran.'],
+    fixes: ['To work locally: open the chat and choose "Local" in the location picker beside the model; run the repair tool to make new chats start locally.', 'To keep using Cloud: in Freebuff Desktop choose "Open local folder" for the project and keep Desktop open.'], areas: ['Local vs Cloud', 'Folder approvals', 'Skills'] },
+  { re: /ENOENT[^]*[\\/]threads[\\/][0-9a-f]{64}/i, title: 'ENOENT … local-projects\\…\\threads\\<id>', meaning: 'A chat in a project that has no folder of its own keeps its files in a private folder named after the chat. That folder was deleted, so the chat cannot open.', causes: ['A cleanup tool, antivirus, OneDrive/Dropbox, or manual deletion removed it.'], fixes: ['Quit Freebuff and run the repair tool: it recreates the folder so the chat opens again (files that were in it are gone; the conversation is intact).'], areas: ['Chats'] },
+  { re: /skill/i, title: 'Skills not found / not usable', meaning: 'Freebuff reads skills from .agents/skills, .claude/skills and .freebuff/skills, in your home folder and in each project. Each skill is a folder with a SKILL.md that starts with name/description front matter.', causes: ['The folder is named "skill" instead of "skills".', 'SKILL.md is missing or its front matter is invalid.', 'The chat runs in Cloud and cannot reach this computer\'s folders.'], fixes: ['See the Skills and Local vs Cloud sections of this report.'], areas: ['Skills', 'Local vs Cloud'] },
+  { re: /credit|refund|freebucks|subscription|charged/i, title: 'Credits used without a working chat', meaning: 'Freebuff refunds sessions that ended unused; this computer keeps a journal of those refund claims.', causes: ['Chats ran in Cloud (Cloud runs use credits) while your files were unreachable.', 'Refund claims not yet confirmed by the server.'], fixes: ['See the Credits and Local vs Cloud sections; send this report to support for a credit review.'], areas: ['Credits', 'Local vs Cloud'] },
   { re: /local checkout changed|reconnect the original folder/i, title: 'The local checkout changed; reconnect the original folder',
     meaning: 'The chat was started (from the web, phone or Cloud) to run in a specific folder on this computer. Freebuff fingerprints that folder by its real path, drive ID and folder ID. Now the folder Freebuff would use has a different fingerprint, so it refuses to run the chat there.',
     causes: ['The chat ran in its own worktree, and the local chat record lost its link to that worktree, so the main folder is used instead (happens without moving anything — the repair tool detects and repairs this).', 'The project or worktree folder was deleted and recreated at the same path (re-cloned, restored from backup, re-extracted, or recreated by OneDrive/Dropbox).', 'The folder was moved/renamed, or is on a network/removable drive whose IDs changed.'],
@@ -1374,7 +1502,9 @@ function restoreBackup(dir, P) {
     for (const db of dbs) for (const s of ['-wal', '-shm']) rmSync(`${db}${s}`, { force: true });
     for (const e of entries) {
       if (e.action === 'copied' || e.action === 'moved') { rmSync(e.original, { recursive: true, force: true }); mkdirSync(dirname(e.original), { recursive: true }); cpSync(e.backup, e.original, { recursive: true }); console.log(`restored ${e.original}`); }
-      if (e.action === 'created') { rmSync(e.original, { force: true }); console.log(`removed ${e.original}`); }
+      if (e.action === 'created') { rmSync(e.original, { recursive: true, force: true }); console.log(`removed ${e.original}`); }
+      if (e.action === 'removed-empty-dir') { mkdirSync(e.original, { recursive: true }); console.log(`recreated ${e.original}`); }
+      if (e.action === 'renamed' && existsSync(e.now) && !existsSync(e.original)) { mkdirSync(dirname(e.original), { recursive: true }); renameRetry(e.now, e.original); console.log(`moved back ${e.original}`); }
     }
     console.log(`\nRestore complete from ${dir}. (Global Git config changes, if any, are not undone automatically; see the report's notes.)`);
   } finally { release(); }
@@ -1540,7 +1670,9 @@ function printSummary(S) {
 }
 
 async function main() {
-  const opts = parseArgs(process.argv.slice(2));
+  const compiled = /\$bunfs|~BUN/.test(import.meta.path ?? '');
+  const argv = process.argv.slice(2);
+  const opts = parseArgs(compiled && argv.length === 0 ? ['--ui'] : argv);
   const P = discoverPaths(opts);
   if (opts.restore) {
     const expanded = opts.restore.trim().replace(/^['"]|['"]$/g, '').replace(/^(~|%USERPROFILE%|\$env:USERPROFILE|\$HOME)(?=[\\/]|$)/i, P.home);
