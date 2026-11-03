@@ -1,3 +1,5 @@
+# DEPRECATED - A new version will be coming soon, but integrated directly into the freebuff app.
+
 # welcome to fart, aka the freebuff automated repair tool.
 ## yes i have a sense of humour. 
 ### also yes that sense of humour matches that of a 5 year old, lmao.
