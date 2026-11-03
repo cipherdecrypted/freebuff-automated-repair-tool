@@ -1,6 +1,6 @@
-welcome to fart, aka the freebuff automated repair tool.
-yes i have a sense of humour. 
-also yes that sense of humour matches that of a 5 year old, lmao.
+# welcome to fart, aka the freebuff automated repair tool.
+## yes i have a sense of humour. 
+### also yes that sense of humour matches that of a 5 year old, lmao.
 
 fart, also known as frt, freebuff repair tool, is an automated tool that repairs things. (i know im genius)
 it automatically locates your freebuff installation, and scans through a huge library of already observed errors, and can also make its own fixes conditionally, based on the errors presented.
