@@ -1670,7 +1670,7 @@ function printSummary(S) {
 }
 
 async function main() {
-  const compiled = /\$bunfs|~BUN/.test(import.meta.path ?? '');
+  const compiled = !/^bun(-baseline)?(\.exe)?$/i.test(basename(process.execPath)) || /\$bunfs|~BUN/.test(import.meta.path ?? '');
   const argv = process.argv.slice(2);
   const opts = parseArgs(compiled && argv.length === 0 ? ['--ui'] : argv);
   const P = discoverPaths(opts);
